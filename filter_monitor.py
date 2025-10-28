@@ -27,7 +27,7 @@ FAN_TYPES = [
 COLORS = [
     "primary",
     "secondary",
-    "accent"
+    "accent",
     "info",
     "success",
     "error",
@@ -81,7 +81,7 @@ class FilterMonitor:
                 config, "expiry_gcode", ""
             )
 
-        self.interval = config.getfloat("interval", 60, above=0.0)
+        self.interval = config.getfloat("interval", 60, minval=5.0)
         self.path = os.path.expanduser(config.get("path", "~/printer_data/config/plugins/filter_monitor"))
         self.file = os.path.join(self.path, self.name + ".csv")
 
@@ -98,6 +98,13 @@ class FilterMonitor:
         self.filter_days_r = None
 
         self.monitor_timer = None
+        self.update_in_progress = False
+
+        # Track last persisted values to avoid unnecessary writes
+        self.last_persisted_runtime = 0.0
+        self.last_persisted_total_runtime = 0.0
+        self.last_persisted_reset = None
+        self.last_persisted_count = 0
 
         self.gcode.register_mux_command(
             "FILTER_STATS",
@@ -163,35 +170,48 @@ class FilterMonitor:
         return self._update(event_time)
 
     def _update(self, event_time = None, stop_timer=False, notify=False):
-        if self.monitor_timer is not None:
-            if event_time is None:
-                self.reactor.update_timer(
-                    self.monitor_timer,
-                    self.reactor.NEVER
-                )
+        # Prevent concurrent updates that could cause file I/O conflicts
+        if self.update_in_progress:
+            self._log_info("Skipping concurrent update")
+            if event_time is not None and not stop_timer:
+                return event_time + self.interval
+            return self.reactor.NEVER
 
-        self._monitor()
+        self.update_in_progress = True
+        try:
+            if self.monitor_timer is not None:
+                if event_time is None:
+                    self.reactor.update_timer(
+                        self.monitor_timer,
+                        self.reactor.NEVER
+                    )
 
-        if notify or (
-            self.filter_expired and
-            self.filter_last_notified is None and
-            event_time is not None
-        ):
-            self._notify()
+            self._monitor()
 
-        self._persist()
+            if notify or (
+                self.filter_expired and
+                self.filter_last_notified is None and
+                event_time is not None
+            ):
+                self._notify()
 
-        if self.monitor_timer is not None:
-            if event_time is None and not stop_timer:
-                self.reactor.update_timer(
-                    self.monitor_timer,
-                    self.reactor.NOW + self.interval
-                )
+            # Only persist on shutdown/restart, or when forcing persist
+            force_persist = stop_timer
+            self._persist(force=force_persist)
 
-        if event_time is not None and not stop_timer:
-            return event_time + self.interval
+            if self.monitor_timer is not None:
+                if event_time is None and not stop_timer:
+                    self.reactor.update_timer(
+                        self.monitor_timer,
+                        self.reactor.NOW + self.interval
+                    )
 
-        return self.reactor.NEVER
+            if event_time is not None and not stop_timer:
+                return event_time + self.interval
+
+            return self.reactor.NEVER
+        finally:
+            self.update_in_progress = False
 
     def _restore(self):
         if not os.path.isfile(self.file):
@@ -206,6 +226,12 @@ class FilterMonitor:
                     self.filter_runtime = ast.literal_eval(row[1])
                     self.filter_total_runtime = ast.literal_eval(row[2])
                     self.filter_reset_count = ast.literal_eval(row[3])
+
+                    # Initialize last persisted values to current restored values
+                    self.last_persisted_runtime = self.filter_runtime
+                    self.last_persisted_total_runtime = self.filter_total_runtime
+                    self.last_persisted_reset = self.filter_last_reset
+                    self.last_persisted_count = self.filter_reset_count
                     break
         except IOError as e:
             self._log_exception("%s %s" % (self.file, str(e)))
@@ -254,7 +280,20 @@ class FilterMonitor:
             self.filter_runtime_r = max(runtime_d, 0)
             self.filter_days_r = max(days_d, 0)
 
-    def _persist(self):
+    def _persist(self, force=False):
+        # Only write to file if values have changed significantly
+        # This prevents excessive SD card writes that can cause lockups
+        RUNTIME_THRESHOLD = 30.0  # Only persist if runtime changed by 30+ seconds
+
+        runtime_changed = abs(self.filter_runtime - self.last_persisted_runtime) >= RUNTIME_THRESHOLD
+        total_runtime_changed = abs(self.filter_total_runtime - self.last_persisted_total_runtime) >= RUNTIME_THRESHOLD
+        reset_changed = self.filter_last_reset != self.last_persisted_reset
+        count_changed = self.filter_reset_count != self.last_persisted_count
+
+        if not force and not (runtime_changed or total_runtime_changed or reset_changed or count_changed):
+            # No significant changes, skip write to avoid SD card stalls
+            return
+
         try:
             with open(self.file, "w", newline="", encoding="utf-8") as f:
                 csv_writer = csv.writer(f, delimiter=",")
@@ -264,10 +303,18 @@ class FilterMonitor:
                     "%f" % self.filter_total_runtime,
                     "%d" % self.filter_reset_count
                 ])
+
+            # Update last persisted values
+            self.last_persisted_runtime = self.filter_runtime
+            self.last_persisted_total_runtime = self.filter_total_runtime
+            self.last_persisted_reset = self.filter_last_reset
+            self.last_persisted_count = self.filter_reset_count
         except IOError as e:
-            self._log_exception("%s %s" % (self.file, str(e)))
-        except:
-            self._log_exception("Unable to write to %s" % self.file)
+            # Don't raise exception on write failures during normal operation
+            # to prevent print failures due to SD card issues
+            self._log_info("Failed to persist data: %s" % str(e))
+        except Exception as e:
+            self._log_info("Unable to write to %s: %s" % (self.file, str(e)))
 
     def _notify(self):
         self.gcode.respond_info(self._format_status())
@@ -397,7 +444,10 @@ class FilterMonitor:
             self.filter_last_reset = time.time()
             self.filter_runtime = 0.0
             self.filter_reset_count += 1
-            self._update()
+
+            # Force persist after reset to ensure data is saved immediately
+            self._monitor()
+            self._persist(force=True)
 
             gcmd.respond_info(
                 self._format_msg("reset!", color="success")
